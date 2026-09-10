@@ -3998,6 +3998,43 @@ app.use((err, req, res, next) => {
 // ab file ke bilkul shuru mein register hoti hai — dekhein sabse upar,
 // requires ke turant baad. Yahan dobara likhne ki zaroorat nahi.
 
+// ══════════════════════════════════════════════════════════════════
+// 🔄 KEEP-ALIVE / SELF-PING — Render ka FREE plan 15 minute ki
+//   inactivity ke baad server ko "sleep" mode mein daal deta hai,
+//   jiski wajah se agli request 30-60 second late khulti hai
+//   ("cold start"). Isse rokne ke liye server khud apne hi
+//   '/api/health' route ko har 10 minute mein internally ping karta
+//   rehta hai — isse Render ko lagta hai server par activity ho
+//   rahi hai, aur woh kabhi sone nahi paata.
+//   NOTE: Render 'RENDER_EXTERNAL_URL' env var apne aap set karta
+//   hai (jaise https://library-backend-4efk.onrender.com) — usi ko
+//   use karte hain taaki URL kahin bhi hardcode na karna pade. Agar
+//   yeh env var kisi wajah se na mile, to neeche wala fallback URL
+//   (ALLOWED_ORIGINS wala apna hi backend domain) use hota hai.
+// ══════════════════════════════════════════════════════════════════
+const SELF_PING_URL = process.env.RENDER_EXTERNAL_URL || 'https://library-backend-4efk.onrender.com';
+const SELF_PING_INTERVAL_MS = 10 * 60 * 1000; // 10 minute (15 minute wali sleep-limit se kam)
+
+function selfPing() {
+    try {
+        const url = SELF_PING_URL.replace(/\/$/, '') + '/api/health';
+        const lib = url.startsWith('https') ? require('https') : require('http');
+        const req = lib.get(url, { timeout: 15000 }, (res) => {
+            // Response body ki zaroorat nahi — sirf request complete hone
+            // dena hai taaki connection turant clean ho jaaye.
+            res.resume();
+            console.log(`✅ Self-ping ok (status ${res.statusCode}) — ${new Date().toISOString()}`);
+        });
+        req.on('timeout', () => { req.destroy(); console.warn('⚠️ Self-ping timeout.'); });
+        req.on('error', (err) => { console.warn('⚠️ Self-ping failed:', err && err.message); });
+    } catch (e) {
+        console.warn('⚠️ Self-ping mein error:', e && e.message);
+    }
+}
+// Server start hone ke thodi der baad pehla ping, fir har 10 minute mein.
+setTimeout(selfPing, 30 * 1000);
+setInterval(selfPing, SELF_PING_INTERVAL_MS);
+
 // Start Server
 app.listen(PORT, () => {
     console.log(`🚀 Server chalu hua port ${PORT} par`);
