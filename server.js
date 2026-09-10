@@ -732,6 +732,13 @@ db.getConnection((err, connection) => {
         // Razorpay payment mandatory" wala check SKIP ho — baaki sab par
         // yeh hamesha mandatory rehta hai.
         "ALTER TABLE material_users ADD COLUMN IF NOT EXISTS invoicePaymentExempt BOOLEAN DEFAULT false",
+        // 🆕 PER-USER CUSTOM PAYMENT AMOUNT: agar yeh NULL hai, to us user ke
+        // liye "Generate Invoice" par Admin ke GLOBAL Fixed Amount
+        // ('material_invoice_settings') ke hisaab se charge hota hai (pehle
+        // jaisa behavior). Agar Admin ne yahan koi specific amount daal diya
+        // hai (jaise ₹5, ₹10, ₹20, ₹100...), to Global Amount ko IGNORE karke
+        // seedha yehi individual amount Razorpay order mein use hota hai.
+        "ALTER TABLE material_users ADD COLUMN IF NOT EXISTS invoiceAmount DECIMAL(10,2)",
         "ALTER TABLE material_bills ADD COLUMN IF NOT EXISTS ownerUserId VARCHAR(50) NOT NULL DEFAULT ''",
         "ALTER TABLE material_bills ADD COLUMN IF NOT EXISTS data TEXT",
         "ALTER TABLE material_bills ADD COLUMN IF NOT EXISTS savedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
@@ -862,6 +869,18 @@ function genMuPassword() {
     return pwd;
 }
 
+// 🆕 PER-USER CUSTOM PAYMENT AMOUNT — helper: client se aaya hua kuch bhi
+// (khaali string, undefined, negative, non-number, waghera) ko safely
+// ya to ek positive 2-decimal number, ya NULL (= "koi override nahi, global
+// default istemal hoga") mein convert karta hai. Isse kabhi bhi DB mein
+// invalid ya negative amount save nahi ho sakta.
+function sanitizeInvoiceAmount(v) {
+    if (v === undefined || v === null || v === '') return null;
+    const n = Number(v);
+    if (!isFinite(n) || n <= 0) return null;
+    return Math.round(n * 100) / 100;
+}
+
 // ══════════════════════════════════════════════════════════════════
 // 🆕 MATERIAL USER / AGENT REGISTRATION & LOGIN ROUTES
 //   (Anmol_material_entry_secure.html + Admin_panel_Login.html isi
@@ -936,7 +955,12 @@ app.post('/api/material/requests/:id/reject', (req, res) => {
 
 // 5) Admin: list all material users (Admin Panel table)
 app.get('/api/material/users', (req, res) => {
-    db.query('SELECT id, userid, name, village, address, email, mobile, photo, status, blockedReason, invoicePaymentExempt, created_at FROM material_users ORDER BY created_at DESC', (err, rows) => {
+    // 🔒 FIX: Postgres unquoted columns hamesha lowercase mein fold ho jaate
+    // hain (invoicePaymentExempt → invoicepaymentexempt) — isliye camelCase
+    // quoted ALIAS ("invoicePaymentExempt") zaroori hai, warna neeche/Admin
+    // Panel ka JS (jo hamesha camelCase property padhta hai, jaise
+    // u.invoicePaymentExempt / u.invoiceAmount) hamesha undefined hi paata.
+    db.query('SELECT id, userid, name, village, address, email, mobile, photo, status, blockedReason, invoicePaymentExempt AS "invoicePaymentExempt", invoiceAmount AS "invoiceAmount", created_at FROM material_users ORDER BY created_at DESC', (err, rows) => {
         if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
         const mapped = (rows || []).map(u => Object.assign({ _docId: String(u.id) }, u));
         res.json(mapped);
@@ -945,7 +969,7 @@ app.get('/api/material/users', (req, res) => {
 
 // 6) Admin: directly create a material user (bina request ke, "New Material User Register" form)
 app.post('/api/material/users', (req, res) => {
-    const { name, village, mobile, photo, status, invoicePaymentExempt } = req.body || {};
+    const { name, village, mobile, photo, status, invoicePaymentExempt, invoiceAmount } = req.body || {};
     if (!name || !village || !mobile) {
         return res.status(400).json({ error: 'Naam, Village aur Mobile zaroori hai!' });
     }
@@ -955,9 +979,9 @@ app.post('/api/material/users', (req, res) => {
         const passwordHash = bcrypt.hashSync(genMuPassword(), 10);
         insertMaterialUserWithRetry(
             (userId) => ({
-                sql: `INSERT INTO material_users (userid, name, village, mobile, photo, password_hash, status, invoicePaymentExempt)
-                      VALUES (?,?,?,?,?,?,?,?)`,
-                params: [userId, name, village, mobile, photo || null, passwordHash, status || 'active', !!invoicePaymentExempt]
+                sql: `INSERT INTO material_users (userid, name, village, mobile, photo, password_hash, status, invoicePaymentExempt, invoiceAmount)
+                      VALUES (?,?,?,?,?,?,?,?,?)`,
+                params: [userId, name, village, mobile, photo || null, passwordHash, status || 'active', !!invoicePaymentExempt, sanitizeInvoiceAmount(invoiceAmount)]
             }),
             (insErr, result, userId) => {
                 if (insErr) return res.status(500).json({ error: 'DB error: ' + insErr.message });
@@ -979,6 +1003,14 @@ app.put('/api/material/users/:id', (req, res) => {
             values.push(fields[f]);
         }
     });
+    // 🆕 PER-USER CUSTOM PAYMENT AMOUNT: alag se handle karte hain kyunki
+    // ismein sanitization chahiye (khaali/invalid value → NULL, taaki woh
+    // user wapas Global Default Amount par chala jaaye — "clear" karna bhi
+    // isi field se possible hai).
+    if (Object.prototype.hasOwnProperty.call(fields, 'invoiceAmount')) {
+        sets.push('invoiceAmount = ?');
+        values.push(sanitizeInvoiceAmount(fields.invoiceAmount));
+    }
     if (!sets.length) return res.status(400).json({ error: 'Update karne ke liye kuch bhi nahi bheja gaya.' });
     values.push(req.params.id);
     db.query(`UPDATE material_users SET ${sets.join(', ')} WHERE id = ?`, values, (err) => {
@@ -992,7 +1024,7 @@ app.put('/api/material/users/:id', (req, res) => {
 //     12 second mein poll karta hai taaki photo/status turant update ho jaaye)
 app.get('/api/material/users/:id', (req, res) => {
     db.query(
-        'SELECT id, userid, name, village, address, email, mobile, photo, status, blockedReason, invoicePaymentExempt, created_at FROM material_users WHERE id = ?',
+        'SELECT id, userid, name, village, address, email, mobile, photo, status, blockedReason, invoicePaymentExempt AS "invoicePaymentExempt", invoiceAmount AS "invoiceAmount", created_at FROM material_users WHERE id = ?',
         [req.params.id],
         (err, rows) => {
             if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
@@ -2934,19 +2966,29 @@ app.get('/api/material/invoice-payment/config', requireActiveMaterialUser, (req,
     if (!req.authUser || req.authUser.role !== 'material_user') {
         return res.status(401).json({ error: 'Material user login zaroori hai.' });
     }
-    db.query('SELECT invoicePaymentExempt FROM material_users WHERE userid=?', [req.authUser.userId], (err, rows) => {
+    // 🔒 FIX + 🆕 PER-USER CUSTOM AMOUNT: quoted camelCase alias zaroori hai
+    // (dekhein upar wali similar fix ki tippani) — warna invoicePaymentExempt
+    // aur naya invoiceAmount dono hamesha undefined milte (Postgres unquoted
+    // columns lowercase mein fold ho jaate hain).
+    db.query('SELECT invoicePaymentExempt AS "invoicePaymentExempt", invoiceAmount AS "invoiceAmount" FROM material_users WHERE userid=?', [req.authUser.userId], (err, rows) => {
         if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
         const exempt = !!(rows && rows[0] && rows[0].invoicePaymentExempt);
+        const userAmount = (rows && rows[0]) ? sanitizeInvoiceAmount(rows[0].invoiceAmount) : null;
         hrGetBlobObj('material_invoice_settings', (sErr, settings) => {
             const enabled = sErr ? true : (settings.enabled !== false); // default ON agar admin ne kabhi set na kiya ho
-            const amount = sErr ? 10 : (Number(settings.amount) || 10);
-            res.json({ paymentRequired: enabled && !exempt, amount, exempt });
+            const globalAmount = sErr ? 10 : (Number(settings.amount) || 10);
+            // 🆕 PER-USER CUSTOM AMOUNT: is specific user ke liye Admin ne agar
+            // koi individual amount set kiya hai, to Global Fixed Amount ki
+            // jagah WAHI istemal hota hai — chahe ₹5 ho, ₹10, ₹20, ya ₹100.
+            const amount = (userAmount !== null) ? userAmount : globalAmount;
+            res.json({ paymentRequired: enabled && !exempt, amount, exempt, isCustomAmount: userAmount !== null });
         });
     });
 });
 
-// Order banao — amount hamesha server-side Admin-settings se, client se
-// bheja gaya koi bhi amount IGNORE hota hai.
+// Order banao — amount hamesha server-side DB se (per-user custom amount ho
+// to wahi, warna Admin ke Global Fixed Amount se) — client se bheja gaya
+// koi bhi amount IGNORE hota hai.
 app.post('/api/material/invoice-payment/order', requireActiveMaterialUser, async (req, res) => {
     if (!req.authUser || req.authUser.role !== 'material_user') {
         return res.status(401).json({ error: 'Material user login zaroori hai.' });
@@ -2954,14 +2996,20 @@ app.post('/api/material/invoice-payment/order', requireActiveMaterialUser, async
     if (!process.env.PAYMENT_API_KEY || !process.env.PAYMENT_API_SECRET) {
         return res.status(501).json({ error: 'Payment keys Render Environment mein set nahi hain.' });
     }
-    db.query('SELECT invoicePaymentExempt FROM material_users WHERE userid=?', [req.authUser.userId], async (err, rows) => {
+    db.query('SELECT invoicePaymentExempt AS "invoicePaymentExempt", invoiceAmount AS "invoiceAmount" FROM material_users WHERE userid=?', [req.authUser.userId], async (err, rows) => {
         if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
         const exempt = !!(rows && rows[0] && rows[0].invoicePaymentExempt);
         if (exempt) return res.status(400).json({ error: 'Aap is check se exempt hain — payment order banane ki zaroorat nahi.' });
+        const userAmount = (rows && rows[0]) ? sanitizeInvoiceAmount(rows[0].invoiceAmount) : null;
         hrGetBlobObj('material_invoice_settings', async (sErr, settings) => {
             const enabled = sErr ? true : (settings.enabled !== false);
-            const amount = sErr ? 10 : (Number(settings.amount) || 10);
+            const globalAmount = sErr ? 10 : (Number(settings.amount) || 10);
             if (!enabled) return res.status(400).json({ error: 'Invoice payment abhi Admin ne band kar rakha hai.' });
+            // 🆕 PER-USER CUSTOM AMOUNT: yahi single source-of-truth hai jo
+            // Razorpay order mein jaata hai — isi user ke liye set kiya gaya
+            // individual amount (agar hai) Global Amount se hamesha priority
+            // leta hai. Client isse kabhi override nahi kar sakta.
+            const amount = (userAmount !== null) ? userAmount : globalAmount;
             try {
                 const order = await razorpayRequest('/v1/orders', {
                     amount: Math.round(amount * 100),
