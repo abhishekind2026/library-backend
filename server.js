@@ -727,6 +727,11 @@ db.getConnection((err, connection) => {
         "ALTER TABLE material_users ADD COLUMN IF NOT EXISTS blockedReason VARCHAR(500)",
         "ALTER TABLE material_users ADD COLUMN IF NOT EXISTS photo TEXT",
         "ALTER TABLE material_users ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255)",
+        // 🆕 INVOICE PAYMENT GATE: Admin is column se decide karta hai ki
+        // kis specific material user ke liye "Generate Invoice se pehle
+        // Razorpay payment mandatory" wala check SKIP ho — baaki sab par
+        // yeh hamesha mandatory rehta hai.
+        "ALTER TABLE material_users ADD COLUMN IF NOT EXISTS invoicePaymentExempt BOOLEAN DEFAULT false",
         "ALTER TABLE material_bills ADD COLUMN IF NOT EXISTS ownerUserId VARCHAR(50) NOT NULL DEFAULT ''",
         "ALTER TABLE material_bills ADD COLUMN IF NOT EXISTS data TEXT",
         "ALTER TABLE material_bills ADD COLUMN IF NOT EXISTS savedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
@@ -931,7 +936,7 @@ app.post('/api/material/requests/:id/reject', (req, res) => {
 
 // 5) Admin: list all material users (Admin Panel table)
 app.get('/api/material/users', (req, res) => {
-    db.query('SELECT id, userid, name, village, address, email, mobile, photo, status, blockedReason, created_at FROM material_users ORDER BY created_at DESC', (err, rows) => {
+    db.query('SELECT id, userid, name, village, address, email, mobile, photo, status, blockedReason, invoicePaymentExempt, created_at FROM material_users ORDER BY created_at DESC', (err, rows) => {
         if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
         const mapped = (rows || []).map(u => Object.assign({ _docId: String(u.id) }, u));
         res.json(mapped);
@@ -940,7 +945,7 @@ app.get('/api/material/users', (req, res) => {
 
 // 6) Admin: directly create a material user (bina request ke, "New Material User Register" form)
 app.post('/api/material/users', (req, res) => {
-    const { name, village, mobile, photo, status } = req.body || {};
+    const { name, village, mobile, photo, status, invoicePaymentExempt } = req.body || {};
     if (!name || !village || !mobile) {
         return res.status(400).json({ error: 'Naam, Village aur Mobile zaroori hai!' });
     }
@@ -950,9 +955,9 @@ app.post('/api/material/users', (req, res) => {
         const passwordHash = bcrypt.hashSync(genMuPassword(), 10);
         insertMaterialUserWithRetry(
             (userId) => ({
-                sql: `INSERT INTO material_users (userid, name, village, mobile, photo, password_hash, status)
-                      VALUES (?,?,?,?,?,?,?)`,
-                params: [userId, name, village, mobile, photo || null, passwordHash, status || 'active']
+                sql: `INSERT INTO material_users (userid, name, village, mobile, photo, password_hash, status, invoicePaymentExempt)
+                      VALUES (?,?,?,?,?,?,?,?)`,
+                params: [userId, name, village, mobile, photo || null, passwordHash, status || 'active', !!invoicePaymentExempt]
             }),
             (insErr, result, userId) => {
                 if (insErr) return res.status(500).json({ error: 'DB error: ' + insErr.message });
@@ -965,7 +970,7 @@ app.post('/api/material/users', (req, res) => {
 // 7) Admin: edit / block / unblock a material user
 app.put('/api/material/users/:id', (req, res) => {
     const fields = req.body || {};
-    const allowed = ['name', 'village', 'address', 'email', 'mobile', 'photo', 'status', 'blockedReason'];
+    const allowed = ['name', 'village', 'address', 'email', 'mobile', 'photo', 'status', 'blockedReason', 'invoicePaymentExempt'];
     const sets = [];
     const values = [];
     allowed.forEach(f => {
@@ -987,7 +992,7 @@ app.put('/api/material/users/:id', (req, res) => {
 //     12 second mein poll karta hai taaki photo/status turant update ho jaaye)
 app.get('/api/material/users/:id', (req, res) => {
     db.query(
-        'SELECT id, userid, name, village, address, email, mobile, photo, status, blockedReason, created_at FROM material_users WHERE id = ?',
+        'SELECT id, userid, name, village, address, email, mobile, photo, status, blockedReason, invoicePaymentExempt, created_at FROM material_users WHERE id = ?',
         [req.params.id],
         (err, rows) => {
             if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
@@ -1297,7 +1302,19 @@ const BLOB_KEYS = ['settings', 'activity', 'notices', 'mem_plans', 'members',
     'hrms_employees', 'hrms_pending_registrations', 'hrms_salary_slips', 'hrms_settings',
     'hrms_attendance', 'hrms_leaves', 'hrms_salary_claims',
     'att_records', 'student_photos', 'selfies', 'attendance_locations', 'comments', 'att_monthly_summary',
-    'fee_records', 'pending_staff', 'salary_claims'];
+    'fee_records', 'pending_staff', 'salary_claims', 'material_invoice_settings',
+    // 🆕 MATERIAL & CATEGORY MANAGER: Admin Panel se banaye gaye Work
+    // Categories (jaise 'Material Supply', 'Plantation', ya koi bhi naya
+    // custom naam) + har category ke andar ka Material Name/Unit/GST%
+    // catalogue — isi generic blob store (GET/POST /api/blob/material_categories)
+    // se save/load hota hai. Public-read isliye rakha hai (kyunki
+    // Anmol_material_entry.html portal ke Section A dropdown aur Section C
+    // material list ko yeh data chahiye — koi sensitive info nahi hai,
+    // sirf ek catalogue hai). Likhna sirf Admin (JWT role='admin') hi kar
+    // sakta hai — neeche ki POST route mein yeh automatically enforce ho
+    // jaata hai kyunki 'material_categories' MULTI_ROLE_WRITE_BLOB_KEYS
+    // mein nahi hai (default rule: sirf role==='admin' likh sakta hai).
+    'material_categories'];
 
 function kvGet(table, key, res, wrapValue) {
     db.query(`SELECT value FROM ${table} WHERE \`key\` = ?`, [key], (err, rows) => {
@@ -2158,6 +2175,65 @@ app.get('/api/admin/pfms-master-ledger', requireRole('admin'), (req, res) => {
     });
 });
 
+// 🔒 FULL SYSTEM RESET — password-verified (backend-side, bcrypt), aur
+//   ab har naya data-model (Invoice Material Portal, PFMS payouts, agent
+//   wallets) bhi shamil karta hai — jo purana client-side reset function
+//   miss kar raha tha. Admin login + Library Settings + PFMS credentials
+//   hamesha bache rehte hain.
+app.post('/api/admin/full-system-reset', requireRole('admin'), (req, res) => {
+    const { password } = req.body || {};
+    if (!password) return res.status(400).json({ error: 'Password zaroori hai.' });
+    db.query('SELECT value FROM kv_admin_entities WHERE `key`=?', ['admins'], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        let admins = [];
+        try { admins = JSON.parse(rows[0] && rows[0].value) || []; } catch (e) {}
+        const me = admins.find(a => a && a.username === req.authUser.username);
+        if (!me || !me.password) return res.status(401).json({ error: 'Admin record nahi mila.' });
+        const ok = looksHashed(me.password) ? bcrypt.compareSync(password, me.password) : me.password === password;
+        if (!ok) return res.status(401).json({ error: 'Galat password! Reset cancel kar diya gaya.' });
+
+        // ── Entity keys (kv_admin_entities) — 'admins' aur 'agent_logins'
+        //    ('agent_logins' credentials hain, isliye bacha lete hain) ──
+        const entityClears = ['staff', 'agents', 'students'];
+        // ── Blob keys — har tarah ka operational data ──
+        const blobClears = [
+            'att_records', 'fee_records', 'salary_claims', 'hrms_registrations', 'staff_att',
+            'leave_requests', 'members', 'notices', 'pending_staff',
+            'hrms_employees', 'hrms_pending_registrations', 'hrms_salary_slips', 'hrms_settings',
+            'hrms_attendance', 'hrms_leaves', 'hrms_salary_claims',
+            'student_photos', 'selfies', 'attendance_locations', 'comments', 'att_monthly_summary',
+            'customer_pending_registrations', 'agent_pending_registrations'
+        ];
+        // ── SQL tables — Invoice Material Portal, PFMS payouts, agent wallets ──
+        const tableClears = ['material_users', 'material_bills', 'payout_requests', 'agent_wallets', 'transactions'];
+
+        let pending = entityClears.length + blobClears.length + tableClears.length;
+        let hadError = false;
+        function done() {
+            pending--;
+            if (pending === 0) {
+                if (hadError) return res.status(500).json({ error: 'Kuch data reset nahi ho paya, dobara try karein.' });
+                res.json({ success: true });
+            }
+        }
+        entityClears.forEach(key => {
+            db.query(
+                'INSERT INTO kv_admin_entities ("key", value) VALUES (?, ?) ON CONFLICT ("key") DO UPDATE SET value = EXCLUDED.value',
+                [key, '[]'], (e) => { if (e) hadError = true; done(); }
+            );
+        });
+        blobClears.forEach(key => {
+            db.query(
+                'INSERT INTO kv_blob ("key", value) VALUES (?, ?) ON CONFLICT ("key") DO UPDATE SET value = EXCLUDED.value',
+                [key, '[]'], (e) => { if (e) hadError = true; done(); }
+            );
+        });
+        tableClears.forEach(table => {
+            db.query(`DELETE FROM ${table}`, (e) => { if (e) hadError = true; done(); });
+        });
+    });
+});
+
 // 🆕 ADMIN: HR Report — sabhi HRMS employees (bank details samet) +
 //   unki latest salary slip + payout status, ek hi consolidated report
 //   mein. Employee jab bhi HRMS se koi claim/data submit kare, yeh
@@ -2843,6 +2919,89 @@ app.post('/api/payments/razorpay/verify', (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════
+// 🧾 MATERIAL PORTAL — PAYMENT-GATED INVOICE GENERATION
+//   "Generate Invoice" dabane se pehle Razorpay se payment mandatory hai
+//   (jab tak Admin us specific material user ke liye ise exempt na kare).
+//   Amount hamesha Admin ke 'material_invoice_settings' se aata hai —
+//   client se kabhi trust nahi karte (security-critical: client agar
+//   apna manchaha amount bhej de to fraud ho sakta tha).
+// ══════════════════════════════════════════════════════════════════
+
+// Material user apna config check karta hai — payment chahiye ya nahi,
+// aur kitna. (Amount yahan sirf DISPLAY ke liye hai — asli charge order
+// banate waqt server phir se DB se hi amount uthata hai.)
+app.get('/api/material/invoice-payment/config', requireActiveMaterialUser, (req, res) => {
+    if (!req.authUser || req.authUser.role !== 'material_user') {
+        return res.status(401).json({ error: 'Material user login zaroori hai.' });
+    }
+    db.query('SELECT invoicePaymentExempt FROM material_users WHERE userid=?', [req.authUser.userId], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        const exempt = !!(rows && rows[0] && rows[0].invoicePaymentExempt);
+        hrGetBlobObj('material_invoice_settings', (sErr, settings) => {
+            const enabled = sErr ? true : (settings.enabled !== false); // default ON agar admin ne kabhi set na kiya ho
+            const amount = sErr ? 10 : (Number(settings.amount) || 10);
+            res.json({ paymentRequired: enabled && !exempt, amount, exempt });
+        });
+    });
+});
+
+// Order banao — amount hamesha server-side Admin-settings se, client se
+// bheja gaya koi bhi amount IGNORE hota hai.
+app.post('/api/material/invoice-payment/order', requireActiveMaterialUser, async (req, res) => {
+    if (!req.authUser || req.authUser.role !== 'material_user') {
+        return res.status(401).json({ error: 'Material user login zaroori hai.' });
+    }
+    if (!process.env.PAYMENT_API_KEY || !process.env.PAYMENT_API_SECRET) {
+        return res.status(501).json({ error: 'Payment keys Render Environment mein set nahi hain.' });
+    }
+    db.query('SELECT invoicePaymentExempt FROM material_users WHERE userid=?', [req.authUser.userId], async (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        const exempt = !!(rows && rows[0] && rows[0].invoicePaymentExempt);
+        if (exempt) return res.status(400).json({ error: 'Aap is check se exempt hain — payment order banane ki zaroorat nahi.' });
+        hrGetBlobObj('material_invoice_settings', async (sErr, settings) => {
+            const enabled = sErr ? true : (settings.enabled !== false);
+            const amount = sErr ? 10 : (Number(settings.amount) || 10);
+            if (!enabled) return res.status(400).json({ error: 'Invoice payment abhi Admin ne band kar rakha hai.' });
+            try {
+                const order = await razorpayRequest('/v1/orders', {
+                    amount: Math.round(amount * 100),
+                    currency: 'INR',
+                    receipt: 'inv_' + req.authUser.userId + '_' + Date.now()
+                });
+                res.json({ orderId: order.id, amount: order.amount, currency: order.currency, key: process.env.PAYMENT_API_KEY });
+            } catch (e) {
+                res.status(502).json({ error: 'Razorpay order banane mein error: ' + e.message });
+            }
+        });
+    });
+});
+
+// Verify karo — signature sahi hone par ek short-lived "invoice unlock"
+// token issue hota hai, jo frontend ko Generate Invoice chalane ke liye
+// chahiye hota hai (single-purpose, 10 minute expiry, isi user se bound).
+app.post('/api/material/invoice-payment/verify', requireActiveMaterialUser, (req, res) => {
+    if (!req.authUser || req.authUser.role !== 'material_user') {
+        return res.status(401).json({ error: 'Material user login zaroori hai.' });
+    }
+    const secret = process.env.PAYMENT_API_SECRET;
+    if (!secret) return res.status(501).json({ error: 'PAYMENT_API_SECRET Render Environment mein set nahi hai.' });
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body || {};
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+        return res.status(400).json({ error: 'Order ID, Payment ID aur Signature teeno zaroori hain.' });
+    }
+    const expected = crypto.createHmac('sha256', secret)
+        .update(razorpay_order_id + '|' + razorpay_payment_id)
+        .digest('hex');
+    if (expected !== razorpay_signature) {
+        return res.status(400).json({ error: 'Payment verify nahi hua — signature match nahi hui.' });
+    }
+    const unlockToken = jwt.sign(
+        { purpose: 'material_invoice_unlock', userId: req.authUser.userId, paymentId: razorpay_payment_id },
+        JWT_SECRET, { expiresIn: '10m' }
+    );
+    res.json({ success: true, unlockToken });
+});
+
 // 🎓 STUDENT SUBSCRIPTION PAYMENT — Student_Attendance.html ka
 //   "Ab Payment Karein" button ab seedha in dono routes se judta hai
 //   (pehle yeh Admin Panel mein manually daale gaye ek alag Firebase
