@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="hi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>404 - पेज नहीं मिला | Anmol Digital Library</title>
+<style>
+  :root{
+    --navy:#0d1e3d;
+    --navy2:#162d57;
+    --gold:#c9a227;
+    --gold2:#f0d060;
+    --gold3:#8a6d10;
+    --cream:#faf7f0;
+    --sky-dark:#0a1730;
+    --sky-mid:#13285a;
+  }
+  *{box-sizing:border-box;margin:0;padding:0;}
+  html,body{height:100%;background:var(--navy);font-family:'Segoe UI',Arial,sans-serif;overflow-x:hidden;}
+  body{
+    display:flex;align-items:center;justify-content:center;
+    width:100vw;height:100vh;
+    padding:0;
+  }
+
+  .card{
+    display:flex;
+    flex-direction:column;
+    width:100%;
+    height:100%;
+    max-width:100%;
+    margin:0;
+    background:linear-gradient(180deg,var(--navy2),var(--navy));
+    border:none;
+    border-radius:0;
+    box-shadow:none;
+    overflow:hidden;
+  }
+
+  /* On real desktop/laptop screens, present it as a large centered panel
+     instead of a raw edge-to-edge box, so it still looks composed. */
+  @media (min-width:900px){
+    body{ padding:4vh 4vw; }
+    .card{
+      max-width:1100px;
+      max-height:900px;
+      height:auto;
+      border:2px solid rgba(201,162,39,0.45);
+      border-radius:22px;
+      box-shadow:0 20px 60px rgba(0,0,0,0.55), inset 0 0 0 1px rgba(255,255,255,0.03);
+    }
+  }
+
+  .scene-wrap{
+    position:relative;
+    width:100%;
+    flex:1 1 auto;
+    min-height:0;
+    aspect-ratio:4/3;
+    background:radial-gradient(ellipse at 70% 15%, var(--sky-mid) 0%, var(--sky-dark) 70%);
+    overflow:hidden;
+  }
+
+  @media (min-width:900px){
+    .scene-wrap{ flex:0 0 auto; }
+  }
+  .stars{
+    position:absolute; inset:0;
+    background-image:
+      radial-gradient(1.5px 1.5px at 20% 15%, #fff8, transparent),
+      radial-gradient(1.5px 1.5px at 70% 10%, #fff6, transparent),
+      radial-gradient(1px 1px at 85% 30%, #fff5, transparent),
+      radial-gradient(1.5px 1.5px at 45% 8%, #fff7, transparent),
+      radial-gradient(1px 1px at 10% 40%, #fff5, transparent),
+      radial-gradient(1px 1px at 60% 25%, #fff4, transparent);
+    animation: twinkle 3s ease-in-out infinite alternate;
+  }
+  @keyframes twinkle{ from{opacity:.5} to{opacity:1} }
+
+  #sceneSVG{ position:absolute; inset:0; width:100%; height:100%; z-index:2; }
+
+  /* speech bubble */
+  .bubble{
+    position:absolute; top:6%; left:6%; max-width:56%;
+    background:var(--cream); color:#1b1b1b; border-radius:16px;
+    padding:clamp(8px,1.6vw,14px) clamp(10px,2vw,16px);
+    font-size:clamp(11px,1.6vw,15px); line-height:1.4;
+    box-shadow:0 8px 20px rgba(0,0,0,0.35); z-index:5;
+    opacity:0; animation:popIn .5s ease-out 1s forwards;
+  }
+  .bubble:after{
+    content:""; position:absolute; right:16px; bottom:-9px;
+    border-width:10px 0 0 8px; border-style:solid;
+    border-color:var(--cream) transparent transparent transparent;
+  }
+  .bubble h3{ margin:0 0 4px; font-size:1.1em; font-weight:800; }
+  .bubble p{ margin:0; color:#444; }
+  @keyframes popIn{ from{opacity:0; transform:scale(.85) translateY(6px);} to{opacity:1; transform:scale(1) translateY(0);} }
+
+  .content{
+    padding:clamp(16px,3vh,30px) clamp(16px,4vw,32px);
+    text-align:center; position:relative; z-index:2; color:var(--cream);
+    flex:0 0 auto;
+  }
+  .content span.err{ color:var(--gold2); text-decoration:line-through; font-weight:700; }
+  .content h2{ font-size:clamp(1.05rem,2.4vw,1.6rem); margin-bottom:8px; color:var(--gold2); }
+  .content p{ font-size:clamp(.85rem,1.6vw,1.05rem); line-height:1.55; color:#dfe3ee; margin-bottom:20px; }
+  .btn-home{
+    display:inline-block; padding:clamp(10px,1.6vw,14px) clamp(18px,3vw,30px);
+    background:linear-gradient(135deg,var(--gold),var(--gold3));
+    color:#1a1305; font-weight:800; border-radius:10px; text-decoration:none;
+    letter-spacing:.3px; box-shadow:0 8px 22px rgba(201,162,39,0.35);
+    font-size:clamp(.85rem,1.5vw,1rem);
+    transition:transform .15s ease, box-shadow .15s ease;
+  }
+  .btn-home:hover{ transform:translateY(-2px); box-shadow:0 12px 28px rgba(201,162,39,0.5); }
+
+  /* Small / mobile screens: shrink comfortably, no fixed tiny box */
+  @media (max-width:600px){
+    .bubble{ max-width:60%; }
+    .content{ padding:16px 16px 22px; }
+    .btn-home{ padding:11px 22px; }
+  }
+
+  @media (max-width:420px){
+    .bubble{ top:4%; left:4%; max-width:64%; }
+  }
+
+  /* Very large / wide desktop screens: cap scene height so it doesn't
+     stretch into an absurdly tall panel */
+  @media (min-width:1400px){
+    .card{ max-width:1200px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="card">
+  <div class="scene-wrap">
+    <div class="stars"></div>
+
+    <svg id="sceneSVG" viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <!-- soft yellow gradient for the visible beam cone -->
+        <radialGradient id="beamGrad" cx="0%" cy="0%" r="100%" gradientUnits="userSpaceOnUse"
+                         fx="168" fy="135" cx2="168" cy2="135">
+        </radialGradient>
+        <radialGradient id="beamFill" gradientUnits="userSpaceOnUse" cx="168" cy="135" r="260">
+          <stop offset="0%" stop-color="#fff6d0" stop-opacity="0.85"/>
+          <stop offset="35%" stop-color="#ffe9a3" stop-opacity="0.35"/>
+          <stop offset="100%" stop-color="#ffe9a3" stop-opacity="0"/>
+        </radialGradient>
+
+        <!-- glow filter for bulb tip and 404 -->
+        <filter id="softGlow" x="-60%" y="-60%" width="220%" height="220%">
+          <feGaussianBlur stdDeviation="4" result="b"/>
+          <feMerge>
+            <feMergeNode in="b"/>
+            <feMergeNode in="SourceGraphic"/>
+          </feMerge>
+        </filter>
+
+        <!-- mask built from the SAME rotating cone shape -> only lets the bright 404 show through where light actually falls -->
+        <mask id="beamMask" maskUnits="userSpaceOnUse" x="0" y="0" width="400" height="300">
+          <rect x="0" y="0" width="400" height="300" fill="black"/>
+          <polygon id="maskCone" points="168,135 430,10 430,150" fill="white" opacity="0.95">
+            <animateTransform attributeName="transform" type="rotate"
+              values="-34 168 135; -10 168 135; 12 168 135; -10 168 135; -34 168 135"
+              keyTimes="0; 0.25; 0.5; 0.75; 1"
+              calcMode="spline"
+              keySplines="0.42 0 0.58 1; 0.42 0 0.58 1; 0.42 0 0.58 1; 0.42 0 0.58 1"
+              dur="5s" repeatCount="indefinite"/>
+          </polygon>
+        </mask>
+      </defs>
+
+      <!-- ground -->
+      <rect x="0" y="248" width="400" height="52" fill="#0c1a38"/>
+
+      <!-- faint always-there 404, barely visible in the dark -->
+      <text x="290" y="118" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif"
+            font-weight="900" font-size="64" fill="#f0d060" opacity="0.10">404</text>
+
+      <!-- visible flashlight beam cone (soft, wide, fading edges — NOT a thin line) -->
+      <polygon id="visibleCone" points="168,135 430,10 430,150" fill="url(#beamFill)" style="mix-blend-mode:screen">
+        <animateTransform attributeName="transform" type="rotate"
+          values="-34 168 135; -10 168 135; 12 168 135; -10 168 135; -34 168 135"
+          keyTimes="0; 0.25; 0.5; 0.75; 1"
+          calcMode="spline"
+          keySplines="0.42 0 0.58 1; 0.42 0 0.58 1; 0.42 0 0.58 1; 0.42 0 0.58 1"
+          dur="5s" repeatCount="indefinite"/>
+      </polygon>
+
+      <!-- bright 404 — only rendered where the beam mask currently overlaps it -->
+      <g mask="url(#beamMask)">
+        <text x="290" y="118" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif"
+              font-weight="900" font-size="64" fill="#f6dd7a" filter="url(#softGlow)">404</text>
+      </g>
+
+      <!-- ===== Yeti sitting up in bed, one arm out holding a flashlight ===== -->
+      <!-- blanket -->
+      <path d="M0 260 Q50 205 110 222 Q150 232 175 258 Q140 285 70 285 Q20 285 0 260Z" fill="#3f5b9c"/>
+      <path d="M0 260 Q50 205 110 222 Q150 232 175 258" fill="none" stroke="#5a78c2" stroke-width="3" opacity="0.6"/>
+
+      <!-- body / head -->
+      <ellipse cx="80" cy="195" rx="52" ry="48" fill="#eef2f8"/>
+      <ellipse cx="80" cy="195" rx="52" ry="48" fill="none" stroke="#c7cfe0" stroke-width="1.5" opacity="0.5"/>
+      <!-- ear -->
+      <circle cx="42" cy="168" r="10" fill="#eef2f8"/>
+      <!-- horn/tuft -->
+      <path d="M70 152 q6 -16 12 0" stroke="#eef2f8" stroke-width="7" fill="none" stroke-linecap="round"/>
+
+      <!-- alert wide-open eyes, looking toward the beam -->
+      <ellipse cx="66" cy="190" rx="8" ry="10" fill="#fff"/>
+      <ellipse cx="96" cy="188" rx="8" ry="10" fill="#fff"/>
+      <circle cx="69" cy="187" r="4" fill="#25293a"/>
+      <circle cx="99" cy="185" r="4" fill="#25293a"/>
+      <!-- eyebrows (worried/alert) -->
+      <path d="M58 176 q8 -6 16 -2" stroke="#25293a" stroke-width="2" fill="none" stroke-linecap="round"/>
+      <path d="M90 174 q8 -4 16 3" stroke="#25293a" stroke-width="2" fill="none" stroke-linecap="round"/>
+      <!-- small nervous open mouth -->
+      <ellipse cx="82" cy="212" rx="6" ry="8" fill="#25293a"/>
+      <!-- cheeks -->
+      <circle cx="54" cy="204" r="5" fill="#f5b8b8" opacity="0.5"/>
+      <circle cx="112" cy="200" r="5" fill="#f5b8b8" opacity="0.5"/>
+
+      <!-- arm reaching up out of the blanket to the flashlight -->
+      <path d="M118 220 Q145 195 158 155" fill="none" stroke="#eef2f8" stroke-width="17" stroke-linecap="round"/>
+      <path d="M118 220 Q145 195 158 155" fill="none" stroke="#c7cfe0" stroke-width="17" stroke-linecap="round" opacity="0.15"/>
+      <!-- hand -->
+      <circle cx="160" cy="150" r="11" fill="#eef2f8"/>
+
+      <!-- flashlight body held in hand, bulb tip = beam apex (168,135) -->
+      <g transform="rotate(-32 160 150)">
+        <rect x="152" y="118" width="16" height="34" rx="4" fill="#8a6d10"/>
+        <rect x="150" y="112" width="20" height="10" rx="3" fill="#c9a227"/>
+      </g>
+      <!-- glowing bulb tip exactly at the cone apex -->
+      <circle cx="168" cy="135" r="6" fill="#fff6d0" filter="url(#softGlow)"/>
+    </svg>
+
+    <div class="bubble">
+      <h3>Hello?? क्या यहाँ कोई है?!</h3>
+      <p>लगता है आप जिस पेज को ढूँढ रहे हैं वो कहीं खो गया है, या शायद इंटरनेट भी सो गया है।</p>
+    </div>
+  </div>
+
+  <div class="content">
+    <h2><span class="err">Error 404</span> — पेज / इंटरनेट कनेक्शन नहीं मिला</h2>
+    <p>ऐसा लगता है यह पेज मौजूद नहीं है, या आपका इंटरनेट कनेक्शन थोड़ी देर के लिए टूट गया है।<br>
+    चिंता की बात नहीं — नीचे दिए बटन से Anmol Digital Library के होम पेज पर वापस जाएँ।</p>
+    <a href="https://digitallibraryanmollive.netlify.app/" class="btn-home">🏠 होम पेज पर वापस जाएँ</a>
+  </div>
+</div>
+
+<script>
+  window.addEventListener('offline', () => {
+    document.querySelector('.content h2').innerHTML = '<span class="err">No Internet</span> — कनेक्शन नहीं मिल रहा';
+  });
+  window.addEventListener('online', () => {
+    document.querySelector('.content h2').innerHTML = '<span class="err">Error 404</span> — पेज / इंटरनेट कनेक्शन नहीं मिला';
+  });
+</script>
+
+</body>
+</html>
