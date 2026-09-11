@@ -70,7 +70,7 @@ app.use(cors({
 }));
 
 app.use(express.json({
-    limit: '25mb',
+    limit: '100mb',
     // 🆕 RAZORPAYX WEBHOOK: signature verify karne ke liye raw (unparsed)
     // body bytes chahiye hote hain — JSON.parse ke baad wo bytes exact
     // waapas nahi milte (whitespace/key-order badal sakta hai), isliye
@@ -79,7 +79,7 @@ app.use(express.json({
     // Buffer reference save hota hai.
     verify: (req, res, buf) => { req.rawBody = buf; }
 }));
-app.use(express.urlencoded({ limit: '25mb', extended: true }));
+app.use(express.urlencoded({ limit: '100mb', extended: true }));
 app.use(express.static('.'));
 
 // ── Auth helper: '/auth/login' se mila JWT token decode karke
@@ -1468,6 +1468,73 @@ function hrSetBlob(key, list, cb) {
         cb
     );
 }
+// ══════════════════════════════════════════════════════════════════
+// 🔒 SALARY PAYOUT — DUPLICATE PAYMENT & MONTH LOCK HELPERS
+//   Poora salary payout cycle: Employee claim submit → Agent/Admin
+//   approve (slip generate) → HR "request-payment" (PFMS ke liye
+//   payout_requests row banti hai) → PFMS "Pay Now" (Razorpay se asli
+//   bank transfer) → 'Paid' + slip.status='paid' (LOCKED).
+//   In teeno guard-points (claim submit, approve, request-payment) par
+//   check hota hai ki isi employee ke isi month/year ka payment pehle
+//   se 'Paid'/process-mein to nahi hai — agar hai, to turant clear
+//   error message ke saath reject ho jaata hai, taaki galti se dobara
+//   payout na ho jaaye.
+// ══════════════════════════════════════════════════════════════════
+const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+
+// hrms_salary_slips ASLI SQL table hai (id, empId, data JSON, created_at).
+// `data` JSON ke andar hi month/year/status/basic/net waghera sab hota hai
+// (jo employee ne claim submit karte waqt bheja tha, wahi copy hoti hai).
+function markSalarySlipPaid(slipId, verifiedBy, verifiedById, cb) {
+    if (!slipId) return cb(null);
+    db.query('SELECT * FROM hrms_salary_slips WHERE id=?', [slipId], (err, rows) => {
+        if (err) return cb(err);
+        const row = rows && rows[0];
+        if (!row) return cb(new Error('Salary slip (' + slipId + ') nahi mili.'));
+        let data = {};
+        try { data = JSON.parse(row.data) || {}; } catch (e) { data = {}; }
+        data.status = 'paid';
+        data.verifiedBy = verifiedBy;
+        if (verifiedById) data.verifiedById = verifiedById;
+        data.paidAt = new Date().toISOString();
+        db.query('UPDATE hrms_salary_slips SET data=? WHERE id=?', [JSON.stringify(data), slipId], (uErr) => cb(uErr || null));
+    });
+}
+
+// Employee ke liye kisi month/year ka payment pehle se 'Paid/Locked' ya
+// process-mein hai kya, yeh check karta hai — dono jagah (hrms_salary_claims
+// aur hrms_salary_slips) dekh kar. cb(err, clashInfo|null) — clashInfo mein
+// { alreadyPaid: bool, label: 'January 2026' } hota hai jab clash mile.
+function findSalaryMonthClash(empId, month, year, cb) {
+    const label = (MONTH_NAMES[month] || 'Is month') + ' ' + year;
+    db.query(
+        "SELECT * FROM hrms_salary_claims WHERE empId=? AND status IN ('pending','pending_admin','approved')",
+        [empId],
+        (err, claimRows) => {
+            if (err) return cb(err);
+            const claimClash = (claimRows || []).find(r => {
+                try { const d = JSON.parse(r.data); return Number(d.month) === Number(month) && Number(d.year) === Number(year); }
+                catch (e) { return false; }
+            });
+            db.query('SELECT * FROM hrms_salary_slips WHERE empId=?', [empId], (err2, slipRows) => {
+                if (err2) return cb(err2);
+                const slipClash = (slipRows || []).find(r => {
+                    try { const d = JSON.parse(r.data); return Number(d.month) === Number(month) && Number(d.year) === Number(year); }
+                    catch (e) { return false; }
+                });
+                let slipData = null;
+                if (slipClash) { try { slipData = JSON.parse(slipClash.data); } catch (e) { slipData = null; } }
+                const alreadyPaid = !!(slipData && slipData.status === 'paid');
+                if (claimClash || slipClash) {
+                    return cb(null, { alreadyPaid, label, slipId: slipClash ? slipClash.id : null });
+                }
+                cb(null, null);
+            });
+        }
+    );
+}
+
+
 // Registration/approval par Admin ya SAHI Agent (jis Library ke liye
 // registration hui thi) hi permission rakhte hain — koi aur agent kisi
 // doosri library ki registration approve nahi kar sakta.
@@ -1799,34 +1866,69 @@ app.post('/api/hr/salary-slips/:slipId/request-payment', requireRole('agent', 'e
     const { empId, empName, netAmount, agentShareAmount } = req.body || {};
     const amount = Number(netAmount);
     const agentShare = Number(agentShareAmount) || 0;
+    const slipId = req.params.slipId;
     if (!empId || !(amount > 0)) return res.status(400).json({ error: 'empId aur sahi netAmount zaroori hain.' });
-    hrGetBlob('hrms_employees', (err, employees) => {
-        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
-        const emp = employees.find(e => String(e.empId || '').toUpperCase() === String(empId).toUpperCase());
-        if (!emp) return res.status(404).json({ error: 'Employee record nahi mila.' });
-        if (!emp.bank || !emp.acc || !emp.ifsc) {
-            return res.status(400).json({ error: 'Employee ne abhi apni Bank Name, Account Number, IFSC "My Profile" mein save nahi ki hai — pehle wahi complete karayein.' });
+
+    // 🔒 DUPLICATE PAYMENT & MONTH LOCK (guard #3 — sabse critical point,
+    // kyunki isi ke turant baad PFMS "Pay Now" se ASLI bank transfer hota
+    // hai). Pehle check: isi salary-slip ke liye pehle se koi payout
+    // request 'HR_Approved'/'Processing'/'Paid' mein to nahi hai.
+    db.query("SELECT * FROM payout_requests WHERE salarySlipId=? AND status IN ('HR_Approved','Processing','Paid')", [slipId], (dupErr, dupRows) => {
+        if (dupErr) return res.status(500).json({ error: 'DB error: ' + dupErr.message });
+        if (dupRows && dupRows.length) {
+            const existing = dupRows[0];
+            return res.status(409).json({
+                error: existing.status === 'Paid'
+                    ? 'Payment for this salary slip is already paid and completed.'
+                    : `Is salary slip ke liye ek payout request pehle se hi "${existing.status}" state mein hai — dobara payment request na bhejein.`
+            });
         }
-        const id = 'PR' + Date.now() + Math.random().toString(36).slice(2, 6);
-        db.query(
-            `INSERT INTO payout_requests
-             (id, agentId, agentName, amount, reason, status, type, employeeId, salarySlipId, bankName, accountNo, ifsc, agentShareAmount)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-            [id, emp.agentUsername || emp.ownerUser || '', empName || emp.name, amount,
-                'Salary payment', 'HR_Approved', 'employee_salary', empId, req.params.slipId,
-                emp.bank, emp.acc, emp.ifsc, agentShare],
-            (iErr) => {
-                // 🔒 NOTE: HR khud verify karke bhej raha hai, isliye seedha
-                // 'HR_Approved' status se banti hai — alag se dobara approve
-                // karne ki zaroorat nahi (jaisa agent-payout flow mein hota
-                // hai). PFMS Portal isse turant "Pay Now" ke liye dekh
-                // paayega.
-                if (iErr) return res.status(500).json({ error: 'DB error: ' + iErr.message });
-                res.status(201).json({ success: true, id });
-            }
-        );
+        // Dusra check: isi employee ke isi month/year ka koi doosra slip
+        // pehle se 'Paid' na ho chuka ho (extra safety agar kisi tarah alag
+        // slipId se dobara try kiya gaya ho).
+        db.query('SELECT data FROM hrms_salary_slips WHERE id=?', [slipId], (sErr, sRows) => {
+            let slipData = {};
+            try { slipData = JSON.parse((sRows && sRows[0] && sRows[0].data) || '{}') || {}; } catch (e) {}
+            findSalaryMonthClash(empId, slipData.month, slipData.year, (cErr, clash) => {
+                if (cErr) return res.status(500).json({ error: 'DB error: ' + cErr.message });
+                if (clash && clash.alreadyPaid) {
+                    return res.status(409).json({ error: `Payment for ${clash.label} is already paid and completed.` });
+                }
+                _createSalaryPayoutRequest();
+            });
+        });
     });
+
+    function _createSalaryPayoutRequest() {
+        hrGetBlob('hrms_employees', (err, employees) => {
+            if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+            const emp = employees.find(e => String(e.empId || '').toUpperCase() === String(empId).toUpperCase());
+            if (!emp) return res.status(404).json({ error: 'Employee record nahi mila.' });
+            if (!emp.bank || !emp.acc || !emp.ifsc) {
+                return res.status(400).json({ error: 'Employee ne abhi apni Bank Name, Account Number, IFSC "My Profile" mein save nahi ki hai — pehle wahi complete karayein.' });
+            }
+            const id = 'PR' + Date.now() + Math.random().toString(36).slice(2, 6);
+            db.query(
+                `INSERT INTO payout_requests
+                 (id, agentId, agentName, amount, reason, status, type, employeeId, salarySlipId, bankName, accountNo, ifsc, agentShareAmount)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+                [id, emp.agentUsername || emp.ownerUser || '', empName || emp.name, amount,
+                    'Salary payment', 'HR_Approved', 'employee_salary', empId, slipId,
+                    emp.bank, emp.acc, emp.ifsc, agentShare],
+                (iErr) => {
+                    // 🔒 NOTE: HR khud verify karke bhej raha hai, isliye seedha
+                    // 'HR_Approved' status se banti hai — alag se dobara approve
+                    // karne ki zaroorat nahi (jaisa agent-payout flow mein hota
+                    // hai). PFMS Portal isse turant "Pay Now" ke liye dekh
+                    // paayega.
+                    if (iErr) return res.status(500).json({ error: 'DB error: ' + iErr.message });
+                    res.status(201).json({ success: true, id });
+                }
+            );
+        });
+    }
 });
+
 
 // Agent apni khud ki requests dekh sakta hai
 app.get('/api/agent/payout-requests', requireRole('agent'), (req, res) => {
@@ -1978,25 +2080,31 @@ app.post('/api/pfms/payout-requests/:id/pay', requireRole('pfms'), (req, res) =>
 // salary-slip update, jaisa pehle tha.
 function _pfmsFinalizePaidLegacy(reqRow, pfmsUsername, res) {
     if (reqRow.type === 'employee_salary') {
-        hrGetBlob('hrms_salary_slips', (sErr, slips) => {
-            if (sErr) { console.warn('PFMS pay: salary slip fetch error:', sErr.message); return res.json({ success: true }); }
-            const idx = slips.findIndex(s => s && s.id === reqRow.salarySlipId);
-            if (idx >= 0) {
-                slips[idx].status = 'paid';
-                slips[idx].verifiedBy = 'PFMS';
-                slips[idx].verifiedById = pfmsUsername;
-                slips[idx].paidAt = new Date().toISOString();
-                hrSetBlob('hrms_salary_slips', slips, (sErr2) => {
-                    if (sErr2) console.warn('PFMS pay: salary slip update error:', sErr2.message);
-                    res.json({ success: true });
-                });
-            } else {
-                res.json({ success: true });
-            }
+        // 🔒 BUGFIX + PAID/LOCK MARKING: pehle yahan `hrGetBlob('hrms_salary_slips')`
+        // use hota tha, jo `kv_blob` table ke ek ALAG blob-row ko update karta
+        // hai — jabki asli slip jo employee ka dashboard dikhata hai
+        // (GET /api/hrms-salary/slips) `hrms_salary_slips` SQL TABLE se aata
+        // hai. Matlab pehle "Paid" mark karne ke baad bhi employee ko slip
+        // hamesha "pending/unpaid" hi dikhta rehta tha — yeh fix ab seedha
+        // sahi table ki row update karta hai, aur yahi is mahine ka
+        // "Paid / Locked" hone ka official moment hai (isi ke against
+        // duplicate-payout-lock check hota hai — neeche dekhein
+        // `/api/hr/salary-slips/:slipId/request-payment`).
+        markSalarySlipPaid(reqRow.salarySlipId, 'PFMS', pfmsUsername, (sErr) => {
+            if (sErr) console.warn('PFMS pay: salary slip update error:', sErr.message);
+            res.json({ success: true });
         });
         return;
     }
-    db.query('UPDATE agent_wallets SET approved_balance = approved_balance - ? WHERE agentId=?', [reqRow.amount, reqRow.agentId], (wErr) => {
+    // 🔒 AUTO-ZERO WALLET: seedha "balance - amount" karne se kabhi-kabhi
+    // floating-point ki wajah se balance 0 ki jagah 0.000001 jaisa reh
+    // jaata tha (UI par "0" na dikh kar ek chhota fraction dikh jaata tha).
+    // Ab agar payout balance ko clear (ya usse zyada) kar raha ho, to
+    // seedha EXACT 0 set karte hain — warna normal partial-deduct hota hai.
+    db.query(
+        `UPDATE agent_wallets SET approved_balance = CASE WHEN approved_balance - ? <= 0.005 THEN 0 ELSE approved_balance - ? END WHERE agentId=?`,
+        [reqRow.amount, reqRow.amount, reqRow.agentId],
+        (wErr) => {
         if (wErr) console.warn('PFMS pay: wallet deduct error:', wErr.message);
         const txnId = 'TXN' + Date.now() + Math.random().toString(36).slice(2, 6);
         db.query(
@@ -2047,7 +2155,11 @@ async function _pfmsInitiateRazorpayXPayout(reqRow, pfmsUsername, res) {
             const agentPayoutId = await _payAgentShare(reqRow.agentId, reqRow.amount, reqRow.id);
             // Internal ledger bhi turant update (bookkeeping) — asli status
             // baad mein webhook se 'Paid'/'Failed' confirm hoga.
-            db.query('UPDATE agent_wallets SET approved_balance = approved_balance - ? WHERE agentId=?', [reqRow.amount, reqRow.agentId], () => {});
+            // 🔒 AUTO-ZERO WALLET (yahan bhi wahi exact-zero fix — dekhein
+            // upar _pfmsFinalizePaidLegacy mein comment).
+            db.query(
+                `UPDATE agent_wallets SET approved_balance = CASE WHEN approved_balance - ? <= 0.005 THEN 0 ELSE approved_balance - ? END WHERE agentId=?`,
+                [reqRow.amount, reqRow.amount, reqRow.agentId], () => {});
             const txnId = 'TXN' + Date.now() + Math.random().toString(36).slice(2, 6);
             db.query(
                 'INSERT INTO transactions (id, agentId, amount, status, reason, data) VALUES (?,?,?,?,?,?)',
@@ -2132,16 +2244,9 @@ app.post('/api/webhooks/razorpayx', (req, res) => {
                     if (mainDone && agentDone) {
                         db.query("UPDATE payout_requests SET status='Paid' WHERE id=?", [pr.id], () => {
                             if (pr.type === 'employee_salary') {
-                                hrGetBlob('hrms_salary_slips', (sErr, slips) => {
-                                    if (sErr) return;
-                                    const idx = slips.findIndex(s => s && s.id === pr.salarySlipId);
-                                    if (idx >= 0) {
-                                        slips[idx].status = 'paid';
-                                        slips[idx].verifiedBy = 'PFMS (RazorpayX)';
-                                        slips[idx].paidAt = new Date().toISOString();
-                                        hrSetBlob('hrms_salary_slips', slips, () => {});
-                                    }
-                                });
+                                // 🔒 Yahan bhi wahi real-table fix (upar
+                                // _pfmsFinalizePaidLegacy ka comment dekhein).
+                                markSalarySlipPaid(pr.salarySlipId, 'PFMS (RazorpayX)', null, () => {});
                             } else {
                                 db.query("UPDATE transactions SET status='verified' WHERE data::text LIKE ?", ['%"payoutRequestId":"' + pr.id + '"%'], () => {});
                             }
@@ -2445,7 +2550,7 @@ app.get('/api/site-data', (req, res) => {
 //   mein blob ki tarah save hota hai — Render ke ephemeral disk pe nahi,
 //   isliye redeploy/restart hone par bhi file gayab nahi hoti.
 // ══════════════════════════════════════════════════════════════════
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } }); // 20MB max
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 } }); // 100MB max
 
 // Slug ko URL-safe banata hai: "Agent Login" → "agent-login"
 function slugify(str) {
@@ -2617,36 +2722,56 @@ app.post('/api/agent-registrations', (req, res) => {
 //   asli mem_plans se) check hoti hai — client jo bheje uska koi
 //   matlab nahi, tamper-proof hai.
 // ══════════════════════════════════════════════════════════════════
-app.post('/api/customer-registrations/order', async (req, res) => {
+app.post('/api/customer-registrations/order', requireRole('agent'), async (req, res) => {
     if (!process.env.PAYMENT_API_KEY || !process.env.PAYMENT_API_SECRET) {
         return res.status(501).json({ error: 'Payment keys Render Environment mein set nahi hain (PAYMENT_API_KEY / PAYMENT_API_SECRET).' });
     }
-    const { name, mobile, email, address, note, agentId, planId } = req.body || {};
+    const { name, mobile, email, address, note, planId } = req.body || {};
     if (!name || !mobile) return res.status(400).json({ error: 'Naam aur mobile zaroori hain.' });
     if (!/^\d{10}$/.test(String(mobile))) return res.status(400).json({ error: 'Sahi 10-digit mobile number likhein.' });
-    if (!agentId) return res.status(400).json({ error: 'agentId zaroori hai.' });
     if (!planId) return res.status(400).json({ error: 'Membership plan chunna zaroori hai.' });
 
-    db.query("SELECT value FROM kv_blob WHERE \"key\"='mem_plans'", (pErr, pRows) => {
-        if (pErr) return res.status(500).json({ error: 'DB error: ' + pErr.message });
-        let plans = [];
-        try { plans = pRows && pRows.length ? JSON.parse(pRows[0].value) : []; } catch (e) {}
-        const plan = plans.find(p => p && p.id === planId);
-        if (!plan) return res.status(404).json({ error: 'Yeh membership plan Admin ke paas set nahi hai.' });
-        razorpayRequest('/v1/orders', {
-            amount: Math.round(Number(plan.price) * 100),
-            currency: 'INR',
-            receipt: 'custreg_' + mobile + '_' + Date.now()
-        }).then((order) => {
-            db.query(
-                'INSERT INTO customer_registration_orders (orderId, name, mobile, email, address, note, agentId, planId, planName, amount) VALUES (?,?,?,?,?,?,?,?,?,?)',
-                [order.id, name, mobile, email || '', address || '', note || '', agentId, plan.id, plan.name || '', plan.price],
-                (err) => {
-                    if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
-                    res.json({ orderId: order.id, amount: order.amount, currency: order.currency, key: process.env.PAYMENT_API_KEY, plan: plan });
-                }
-            );
-        }).catch((e) => res.status(502).json({ error: 'Razorpay order banane mein error: ' + e.message }));
+    // 🔒 FIX: agentId ab KABHI client se nahi liya jaata (pehle body se
+    // aata tha, jo frontend session/URL-param ki gadbadi se khaali reh
+    // jaata tha aur "agentId zaroori hai" error deta tha — aur security
+    // ki nazar se bhi risky tha, kyunki koi bhi agent chahe to dusre
+    // agent ka agentId bhejkar uske account mein fake registration daal
+    // sakta tha). Ab seedha JWT-verified login session se milta hai —
+    // isliye logged-in agent ke liye yeh field KABHI khaali nahi rahega,
+    // aur koi bhi agentId spoof bhi nahi kar sakta.
+    const loginUsername = req.authUser.username;
+    db.query('SELECT value FROM kv_admin_entities WHERE `key`=?', ['agents'], (aErr, aRows) => {
+        if (aErr) return res.status(500).json({ error: 'DB error: ' + aErr.message });
+        let agents = [];
+        try { agents = JSON.parse(aRows && aRows[0] && aRows[0].value) || []; } catch (e) {}
+        const agentProfile = agents.find(a => a && a.username === loginUsername);
+        // Admin Panel ka "Pending Registrations" table AGT001-jaisi
+        // agentId se hi agent ka naam/company match karta hai — agar wo
+        // set hai to wahi use karo, warna login-username fallback (jo
+        // hamesha guaranteed maujood hota hai).
+        const agentId = (agentProfile && agentProfile.agentId) || loginUsername;
+
+        db.query("SELECT value FROM kv_blob WHERE \"key\"='mem_plans'", (pErr, pRows) => {
+            if (pErr) return res.status(500).json({ error: 'DB error: ' + pErr.message });
+            let plans = [];
+            try { plans = pRows && pRows.length ? JSON.parse(pRows[0].value) : []; } catch (e) {}
+            const plan = plans.find(p => p && p.id === planId);
+            if (!plan) return res.status(404).json({ error: 'Yeh membership plan Admin ke paas set nahi hai.' });
+            razorpayRequest('/v1/orders', {
+                amount: Math.round(Number(plan.price) * 100),
+                currency: 'INR',
+                receipt: 'custreg_' + mobile + '_' + Date.now()
+            }).then((order) => {
+                db.query(
+                    'INSERT INTO customer_registration_orders (orderId, name, mobile, email, address, note, agentId, planId, planName, amount) VALUES (?,?,?,?,?,?,?,?,?,?)',
+                    [order.id, name, mobile, email || '', address || '', note || '', agentId, plan.id, plan.name || '', plan.price],
+                    (err) => {
+                        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+                        res.json({ orderId: order.id, amount: order.amount, currency: order.currency, key: process.env.PAYMENT_API_KEY, plan: plan });
+                    }
+                );
+            }).catch((e) => res.status(502).json({ error: 'Razorpay order banane mein error: ' + e.message }));
+        });
     });
 });
 
@@ -3669,14 +3794,29 @@ app.get('/api/hrms-salary/claims', (req, res) => {
 app.post('/api/hrms-salary/claims', (req, res) => {
     const claim = req.body || {};
     const id = claim.id || ('CLM' + Date.now());
-    db.query(
-        'INSERT INTO hrms_salary_claims (id, empId, status, netAmount, data) VALUES (?,?,?,?,?)',
-        [id, claim.empId || null, 'pending', claim.net || 0, JSON.stringify(claim)],
-        (err) => {
-            if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
-            res.status(201).json({ id });
+    const month = Number(claim.month), year = Number(claim.year);
+    if (!claim.empId || !(month >= 0 && month <= 11) || !year) {
+        return res.status(400).json({ error: 'empId, month aur year zaroori hain.' });
+    }
+    // 🔒 DUPLICATE PAYMENT & MONTH LOCK (guard #1 — claim submit time)
+    findSalaryMonthClash(claim.empId, month, year, (cErr, clash) => {
+        if (cErr) return res.status(500).json({ error: 'DB error: ' + cErr.message });
+        if (clash) {
+            return res.status(409).json({
+                error: clash.alreadyPaid
+                    ? `Payment for ${clash.label} is already paid and completed.`
+                    : `${clash.label} ka salary claim pehle se hi process mein hai — dobara submit na karein.`
+            });
         }
-    );
+        db.query(
+            'INSERT INTO hrms_salary_claims (id, empId, status, netAmount, data) VALUES (?,?,?,?,?)',
+            [id, claim.empId || null, 'pending', claim.net || 0, JSON.stringify(claim)],
+            (err) => {
+                if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+                res.status(201).json({ id });
+            }
+        );
+    });
 });
 // Staff claim → Agent verifies (deduct agent wallet)
 app.post('/api/wallet/salary-claims/:id/verify', requireRole('agent', 'admin'), (req, res) => {
@@ -3706,11 +3846,21 @@ app.post('/api/hrms-salary/claims/:id/approve', requireRole('admin'), (req, res)
         if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
         if (!rows || !rows.length) return res.status(400).json({ error: 'Yeh claim pending nahi hai (already processed).' });
         const c = rows[0];
-        db.query("UPDATE hrms_salary_claims SET status='approved' WHERE id=?", [c.id], () => {
-            const slipId = 'SLP' + Date.now();
-            db.query('INSERT INTO hrms_salary_slips (id, empId, data) VALUES (?,?,?)', [slipId, c.empId, c.data], (sErr) => {
-                if (sErr) return res.status(500).json({ error: 'DB error: ' + sErr.message });
-                res.json({ netAmount: c.netAmount, slipId });
+        let claimData = {};
+        try { claimData = JSON.parse(c.data) || {}; } catch (e) {}
+        // 🔒 DUPLICATE PAYMENT & MONTH LOCK (guard #2 — approve time,
+        // defense-in-depth agar race condition se do claims bana chuke ho)
+        findSalaryMonthClash(c.empId, claimData.month, claimData.year, (cErr, clash) => {
+            if (cErr) return res.status(500).json({ error: 'DB error: ' + cErr.message });
+            if (clash && clash.alreadyPaid) {
+                return res.status(409).json({ error: `Payment for ${clash.label} is already paid and completed.` });
+            }
+            db.query("UPDATE hrms_salary_claims SET status='approved' WHERE id=?", [c.id], () => {
+                const slipId = 'SLP' + Date.now();
+                db.query('INSERT INTO hrms_salary_slips (id, empId, data) VALUES (?,?,?)', [slipId, c.empId, c.data], (sErr) => {
+                    if (sErr) return res.status(500).json({ error: 'DB error: ' + sErr.message });
+                    res.json({ netAmount: c.netAmount, slipId });
+                });
             });
         });
     });
@@ -3987,7 +4137,7 @@ app.use((err, req, res, next) => {
     console.error('❌ Unhandled error:', err && err.message);
     if (err && err.name === 'MulterError') {
         let msg = 'File upload mein error: ' + err.message;
-        if (err.code === 'LIMIT_FILE_SIZE') msg = 'File bahut badi hai (max 20MB allowed).';
+        if (err.code === 'LIMIT_FILE_SIZE') msg = 'File bahut badi hai (max 100MB allowed).';
         return res.status(400).json({ error: msg });
     }
     res.status(500).json({ error: (err && err.message) || 'Server mein anjaan error aaya.' });
@@ -3997,6 +4147,43 @@ app.use((err, req, res, next) => {
 // 🛡️ Process-level crash-protection (uncaughtException/unhandledRejection)
 // ab file ke bilkul shuru mein register hoti hai — dekhein sabse upar,
 // requires ke turant baad. Yahan dobara likhne ki zaroorat nahi.
+
+// ══════════════════════════════════════════════════════════════════
+// 🔄 KEEP-ALIVE / SELF-PING — Render ka FREE plan 15 minute ki
+//   inactivity ke baad server ko "sleep" mode mein daal deta hai,
+//   jiski wajah se agli request 30-60 second late khulti hai
+//   ("cold start"). Isse rokne ke liye server khud apne hi
+//   '/api/health' route ko har 10 minute mein internally ping karta
+//   rehta hai — isse Render ko lagta hai server par activity ho
+//   rahi hai, aur woh kabhi sone nahi paata.
+//   NOTE: Render 'RENDER_EXTERNAL_URL' env var apne aap set karta
+//   hai (jaise https://library-backend-4efk.onrender.com) — usi ko
+//   use karte hain taaki URL kahin bhi hardcode na karna pade. Agar
+//   yeh env var kisi wajah se na mile, to neeche wala fallback URL
+//   (ALLOWED_ORIGINS wala apna hi backend domain) use hota hai.
+// ══════════════════════════════════════════════════════════════════
+const SELF_PING_URL = process.env.RENDER_EXTERNAL_URL || 'https://library-backend-4efk.onrender.com';
+const SELF_PING_INTERVAL_MS = 10 * 60 * 1000; // 10 minute (15 minute wali sleep-limit se kam)
+
+function selfPing() {
+    try {
+        const url = SELF_PING_URL.replace(/\/$/, '') + '/api/health';
+        const lib = url.startsWith('https') ? require('https') : require('http');
+        const req = lib.get(url, { timeout: 15000 }, (res) => {
+            // Response body ki zaroorat nahi — sirf request complete hone
+            // dena hai taaki connection turant clean ho jaaye.
+            res.resume();
+            console.log(`✅ Self-ping ok (status ${res.statusCode}) — ${new Date().toISOString()}`);
+        });
+        req.on('timeout', () => { req.destroy(); console.warn('⚠️ Self-ping timeout.'); });
+        req.on('error', (err) => { console.warn('⚠️ Self-ping failed:', err && err.message); });
+    } catch (e) {
+        console.warn('⚠️ Self-ping mein error:', e && e.message);
+    }
+}
+// Server start hone ke thodi der baad pehla ping, fir har 10 minute mein.
+setTimeout(selfPing, 30 * 1000);
+setInterval(selfPing, SELF_PING_INTERVAL_MS);
 
 // Start Server
 app.listen(PORT, () => {
